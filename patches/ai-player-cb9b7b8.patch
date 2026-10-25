@@ -1,0 +1,747 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fb705ed..2f693a3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -44,6 +44,8 @@ endforeach()
+ 
+ 
+ set(SOURCE_FILES
++        SpaceCadetPinball/ai_bridge.cpp
++        SpaceCadetPinball/ai_bridge.h
+         SpaceCadetPinball/control.cpp
+         SpaceCadetPinball/control.h
+         SpaceCadetPinball/EmbeddedData.cpp
+@@ -195,6 +197,9 @@ if(WIN32)
+ endif(WIN32)
+ 
+ add_executable(SpaceCadetPinball ${SOURCE_FILES})
++if(MSVC)
++    target_compile_options(SpaceCadetPinball PRIVATE /utf-8)
++endif()
+ 
+ # Skip pch on foreign code
+ set_source_files_properties(
+@@ -217,6 +222,9 @@ if(${CMAKE_VERSION} VERSION_GREATER "3.16.0" OR ${CMAKE_VERSION} VERSION_EQUAL "
+ endif()
+ 
+ target_link_libraries(SpaceCadetPinball ${SDL2_LIBRARY} ${SDL2_MIXER_LIBRARY})
++if(WIN32)
++    target_link_libraries(SpaceCadetPinball ws2_32)
++endif()
+ 
+ # On Windows, copy DLL to output
+ if(WIN32)
+diff --git a/SpaceCadetPinball/TFlipperEdge.cpp b/SpaceCadetPinball/TFlipperEdge.cpp
+index 810dc1a..145b6d1 100644
+--- a/SpaceCadetPinball/TFlipperEdge.cpp
++++ b/SpaceCadetPinball/TFlipperEdge.cpp
+@@ -1,5 +1,6 @@
+ #include "pch.h"
+ #include "TFlipperEdge.h"
++#include "ai_bridge.h"
+ 
+ 
+ #include "pb.h"
+@@ -120,6 +121,7 @@ float TFlipperEdge::FindCollisionDistance(const ray_type& ray)
+ 
+ void TFlipperEdge::EdgeCollision(TBall* ball, float distance)
+ {
++	ai::OnFlipperHit(this, FlipperFlag != MessageCode::TFlipperNull);
+ 	if (FlipperFlag == MessageCode::TFlipperNull)
+ 	{
+ 		maths::basic_collision(
+diff --git a/SpaceCadetPinball/ai_bridge.cpp b/SpaceCadetPinball/ai_bridge.cpp
+new file mode 100644
+index 0000000..a5c493e
+--- /dev/null
++++ b/SpaceCadetPinball/ai_bridge.cpp
+@@ -0,0 +1,335 @@
++#include "pch.h"
++#include "ai_bridge.h"
++
++#include <random>
++
++#ifdef _WIN32
++#define NOMINMAX
++#include <winsock2.h>
++#include <ws2tcpip.h>
++using sock_t = SOCKET;
++#else
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++using sock_t = int;
++#define INVALID_SOCKET (-1)
++#define closesocket close
++#endif
++
++#include "control.h"
++#include "pb.h"
++#include "TBall.h"
++#include "TFlipper.h"
++#include "TFlipperEdge.h"
++#include "TPinballTable.h"
++#include "TPlunger.h"
++
++namespace ai
++{
++	bool Enabled = false;
++	bool Headless = false;
++
++	namespace
++	{
++		constexpr int MaxBallSlots = 3;
++		constexpr int LaneCount = 17;
++		constexpr float LaunchDelay = 0.6f;
++		constexpr float LaunchCooldown = 1.5f;
++		constexpr float HitDebounce = 0.25f;
++
++		struct Field
++		{
++			const char* Name;
++			double Value;
++		};
++
++		sock_t Client = INVALID_SOCKET;
++		std::string RecvBuf;
++		std::mt19937 Rng{std::random_device{}()};
++
++		bool LeftOn = false, RightOn = false;
++		int HitsActive[2]{}, HitsPassive[2]{};
++		float LastHitTime[2][2]{};
++		int Launches = 0, Drains = 0;
++		int PrevBallCount = 0;
++		float PlungerWait = 0, SinceLaunch = LaunchCooldown;
++		float GameTime = 0;
++
++		TBall* BallInPlungerLane()
++		{
++			auto table = pb::MainTable;
++			for (auto ball : table->BallList)
++			{
++				if (!ball->ActiveFlag)
++					continue;
++				auto dy = ball->Position.Y - table->PlungerPosition.Y;
++				if (std::fabs(ball->Position.X - table->PlungerPosition.X) < 0.8f &&
++					dy > -1.0f && dy < 3.0f && ball->Speed < 0.8f)
++					return ball;
++			}
++			return nullptr;
++		}
++
++		std::vector<Field> CollectFields()
++		{
++			auto table = pb::MainTable;
++			std::vector<Field> f;
++			auto add = [&f](const char* name, double value) { f.push_back({name, value}); };
++
++			int mission, missionReady, fuel, shootAgain, ballSave;
++			control::GetAiInfo(mission, missionReady, fuel, shootAgain, ballSave);
++			auto angle = [](const TFlipperEdge* e) { return e->AngleMax != 0 ? e->CurrentAngle / e->AngleMax : 0.0f; };
++			auto leftEdge = table->FlipperL->FlipperEdge, rightEdge = table->FlipperR->FlipperEdge;
++
++			add("score", table->CurScore + static_cast<double>(table->CurScoreE9) * 1e9);
++			add("game_over", pb::game_mode == GameModes::GameOver);
++			add("ball_count", table->BallCount);
++			add("extra_balls", table->ExtraBalls);
++			add("multiball", table->MultiballCount);
++			add("tilt", table->TiltLockFlag);
++			add("score_mult", table->ScoreMultiplier);
++			add("mission", mission);
++			add("mission_ready", missionReady);
++			add("fuel", fuel);
++			add("shoot_again", shootAgain);
++			add("ball_save", ballSave);
++			add("time", GameTime);
++			add("lflip_angle", angle(leftEdge));
++			add("lflip_active", LeftOn);
++			add("rflip_angle", angle(rightEdge));
++			add("rflip_active", RightOn);
++			add("lflip_px", leftEdge->RotOrigin.X);
++			add("lflip_py", leftEdge->RotOrigin.Y);
++			add("rflip_px", rightEdge->RotOrigin.X);
++			add("rflip_py", rightEdge->RotOrigin.Y);
++			add("hits_l_act", HitsActive[0]);
++			add("hits_r_act", HitsActive[1]);
++			add("hits_l_pas", HitsPassive[0]);
++			add("hits_r_pas", HitsPassive[1]);
++			add("drains", Drains);
++			add("launches", Launches);
++			add("plunger_ready", BallInPlungerLane() != nullptr);
++
++			std::vector<TBall*> balls;
++			for (auto ball : table->BallList)
++				if (ball->ActiveFlag)
++					balls.push_back(ball);
++			std::sort(balls.begin(), balls.end(), [](const TBall* a, const TBall* b) { return a->Position.Y > b->Position.Y; });
++			add("n_balls", static_cast<double>(balls.size()));
++			static const char* const ballNames[MaxBallSlots][5] = {
++				{"b0_act", "b0_x", "b0_y", "b0_vx", "b0_vy"},
++				{"b1_act", "b1_x", "b1_y", "b1_vx", "b1_vy"},
++				{"b2_act", "b2_x", "b2_y", "b2_vx", "b2_vy"},
++			};
++			for (int i = 0; i < MaxBallSlots; i++)
++			{
++				const bool present = i < static_cast<int>(balls.size());
++				const TBall* b = present ? balls[i] : nullptr;
++				add(ballNames[i][0], present);
++				add(ballNames[i][1], present ? b->Position.X : 0);
++				add(ballNames[i][2], present ? b->Position.Y : 0);
++				add(ballNames[i][3], present ? b->Direction.X * b->Speed : 0);
++				add(ballNames[i][4], present ? b->Direction.Y * b->Speed : 0);
++			}
++
++			static const char* const laneNames[LaneCount] = {
++				"lane0", "lane1", "lane2", "lane3", "lane4", "lane5", "lane6", "lane7", "lane8",
++				"lane9", "lane10", "lane11", "lane12", "lane13", "lane14", "lane15", "lane16"};
++			float lanes[LaneCount];
++			control::GetAiLanes(lanes, LaneCount);
++			for (int i = 0; i < LaneCount; i++)
++				add(laneNames[i], lanes[i]);
++			return f;
++		}
++	}
++
++	bool Init(int port)
++	{
++#ifdef _WIN32
++		WSADATA wsa;
++		if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
++			return false;
++#endif
++		sock_t server = socket(AF_INET, SOCK_STREAM, 0);
++		if (server == INVALID_SOCKET)
++			return false;
++		int yes = 1;
++#ifdef _WIN32
++		setsockopt(server, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&yes), sizeof yes);
++#else
++		setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof yes);
++#endif
++		sockaddr_in addr{};
++		addr.sin_family = AF_INET;
++		addr.sin_port = htons(static_cast<unsigned short>(port));
++		inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
++		if (bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 || listen(server, 1) != 0)
++		{
++			closesocket(server);
++			return false;
++		}
++		printf("[ai] waiting for the agent on 127.0.0.1:%d\n", port);
++		fflush(stdout);
++		Client = accept(server, nullptr, nullptr);
++		closesocket(server);
++		if (Client == INVALID_SOCKET)
++			return false;
++		setsockopt(Client, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&yes), sizeof yes);
++
++		std::string header = "H";
++		for (const auto& field : CollectFields())
++			header += std::string(" ") + field.Name;
++		Send(header + "\n");
++		return true;
++	}
++
++	void Shutdown()
++	{
++		if (Client != INVALID_SOCKET)
++			closesocket(Client);
++		Client = INVALID_SOCKET;
++#ifdef _WIN32
++		WSACleanup();
++#endif
++	}
++
++	void Send(const std::string& line)
++	{
++		size_t sent = 0;
++		while (Client != INVALID_SOCKET && sent < line.size())
++		{
++			auto n = send(Client, line.data() + sent, static_cast<int>(line.size() - sent), 0);
++			if (n <= 0)
++				return;
++			sent += n;
++		}
++	}
++
++	bool ReadCommand(Command& cmd)
++	{
++		while (true)
++		{
++			auto end = RecvBuf.find('\n');
++			if (end != std::string::npos)
++			{
++				auto line = RecvBuf.substr(0, end);
++				RecvBuf.erase(0, end + 1);
++				if (line.empty())
++					continue;
++				cmd = {};
++				cmd.Type = line[0];
++				if (cmd.Type == 'S')
++				{
++					int left = 0, right = 0, frames = 1;
++					sscanf(line.c_str() + 1, "%d %d %d", &left, &right, &frames);
++					cmd.Left = left != 0;
++					cmd.Right = right != 0;
++					cmd.Frames = frames > 1 ? frames : 1;
++				}
++				return true;
++			}
++			char chunk[512];
++			auto n = recv(Client, chunk, sizeof chunk, 0);
++			if (n <= 0)
++				return false;
++			RecvBuf.append(chunk, n);
++		}
++	}
++
++	void NewGame()
++	{
++		LeftOn = RightOn = false;
++		HitsActive[0] = HitsActive[1] = HitsPassive[0] = HitsPassive[1] = 0;
++		for (auto& times : LastHitTime)
++			times[0] = times[1] = -HitDebounce;
++		Launches = Drains = 0;
++		PlungerWait = 0;
++		SinceLaunch = LaunchCooldown;
++		GameTime = 0;
++		pb::replay_level(false);
++		PrevBallCount = pb::MainTable->BallCount;
++	}
++
++	void SetFlippers(bool left, bool right)
++	{
++		auto table = pb::MainTable;
++		if (pb::game_mode != GameModes::InGame)
++			left = right = false;
++		if (left != LeftOn)
++		{
++			LeftOn = left;
++			table->Message(left ? MessageCode::LeftFlipperInputPressed : MessageCode::LeftFlipperInputReleased,
++			               pb::time_now);
++		}
++		if (right != RightOn)
++		{
++			RightOn = right;
++			table->Message(right ? MessageCode::RightFlipperInputPressed : MessageCode::RightFlipperInputReleased,
++			               pb::time_now);
++		}
++	}
++
++	void AfterFrame()
++	{
++		auto table = pb::MainTable;
++		const float dt = FrameMs * 0.001f;
++		GameTime += dt;
++		SinceLaunch += dt;
++		table->CheatsUsed = 1;
++
++		if (table->BallCount < PrevBallCount)
++			Drains++;
++		PrevBallCount = table->BallCount;
++
++		const bool ready = pb::game_mode == GameModes::InGame && !table->TiltLockFlag &&
++			table->Plunger->SomeCounter == 0 && BallInPlungerLane();
++		PlungerWait = ready ? PlungerWait + dt : 0;
++		if (PlungerWait >= LaunchDelay && SinceLaunch >= LaunchCooldown)
++		{
++			std::uniform_real_distribution<float> strength(0.55f, 1.0f);
++			auto plunger = table->Plunger;
++			plunger->PullbackStartedFlag = true;
++			plunger->Boost = plunger->MaxPullback * strength(Rng);
++			plunger->Message(MessageCode::PlungerInputReleased, 0.0f);
++			Launches++;
++			PlungerWait = 0;
++			SinceLaunch = 0;
++		}
++	}
++
++	void OnFlipperHit(const TFlipperEdge* edge, bool active)
++	{
++		auto table = pb::MainTable;
++		if (!Enabled || !table)
++			return;
++		int side;
++		if (table->FlipperL && table->FlipperL->FlipperEdge == edge)
++			side = 0;
++		else if (table->FlipperR && table->FlipperR->FlipperEdge == edge)
++			side = 1;
++		else
++			return;
++
++		active = active || (side == 0 ? LeftOn : RightOn);
++		auto& lastTime = LastHitTime[side][active ? 0 : 1];
++		if (GameTime - lastTime < HitDebounce)
++			return;
++		lastTime = GameTime;
++		++(active ? HitsActive : HitsPassive)[side];
++	}
++
++	std::string Observation()
++	{
++		std::string line = "O";
++		char value[32];
++		for (const auto& field : CollectFields())
++		{
++			snprintf(value, sizeof value, " %.10g", field.Value);
++			line += value;
++		}
++		return line + "\n";
++	}
++}
+diff --git a/SpaceCadetPinball/ai_bridge.h b/SpaceCadetPinball/ai_bridge.h
+new file mode 100644
+index 0000000..c74a65a
+--- /dev/null
++++ b/SpaceCadetPinball/ai_bridge.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++class TFlipperEdge;
++
++namespace ai
++{
++	extern bool Enabled;
++	extern bool Headless;
++
++	constexpr float FrameMs = 1000.0f / 120.0f;
++
++	struct Command
++	{
++		char Type;
++		bool Left, Right;
++		int Frames;
++	};
++
++	bool Init(int port);
++	void Shutdown();
++	bool ReadCommand(Command& cmd);
++	void Send(const std::string& line);
++
++	void NewGame();
++	void SetFlippers(bool left, bool right);
++	void AfterFrame();
++	std::string Observation();
++
++	void OnFlipperHit(const TFlipperEdge* edge, bool active);
++}
+diff --git a/SpaceCadetPinball/control.cpp b/SpaceCadetPinball/control.cpp
+index 4b6377c..206768f 100644
+--- a/SpaceCadetPinball/control.cpp
++++ b/SpaceCadetPinball/control.cpp
+@@ -4601,3 +4601,39 @@ void control::WaitingDeploymentController(MessageCode code, TPinballComponent* c
+ 		break;
+ 	}
+ }
++
++
++void control::GetAiInfo(int& mission, int& missionReady, int& fuel, int& shootAgain, int& ballSave)
++{
++	mission = missionReady = fuel = shootAgain = ballSave = 0;
++	if (!lite198)
++		return;
++	mission = lite198->MessageField;
++	missionReady = lite56 && lite56->light_on() ? 1 : 0;
++	fuel = fuel_bargraph ? fuel_bargraph->Message(MessageCode::TLightGroupGetOnCount, 0.0) : 0;
++	shootAgain = lite199 && lite199->light_on() ? 1 : 0;
++	ballSave = lite200 && lite200->light_on() ? 1 : 0;
++}
++
++
++void control::GetAiLanes(float* out, int count)
++{
++	for (int i = 0; i < count; i++)
++		out[i] = 0;
++	if (!bmpr_inc_lights || !ramp_bmpr_inc_lights)
++		return;
++	int n = 0;
++	auto put = [&](bool on)
++	{
++		if (n < count)
++			out[n] = on ? 1.0f : 0.0f;
++		n++;
++	};
++	for (int i = 0; i < 4; i++)
++		put(i < static_cast<int>(bmpr_inc_lights->List.size()) && bmpr_inc_lights->List[i]->light_on());
++	for (int i = 0; i < 4; i++)
++		put(i < static_cast<int>(ramp_bmpr_inc_lights->List.size()) && ramp_bmpr_inc_lights->List[i]->light_on());
++	TLight* others[] = {lite169, lite170, lite171, lite17, lite18, lite27, lite28, lite29, lite30};
++	for (auto light : others)
++		put(light && light->light_on());
++}
+diff --git a/SpaceCadetPinball/control.h b/SpaceCadetPinball/control.h
+index 78c3738..03c636f 100644
+--- a/SpaceCadetPinball/control.h
++++ b/SpaceCadetPinball/control.h
+@@ -92,6 +92,8 @@ public:
+ 	static void UnstuckBall(TBall& ball, int dt);
+ 	static bool CheckBallInControlBounds(const TBall& ball, const TCollisionComponent& cmp);
+ 	static void cheat_bump_rank();
++	static void GetAiLanes(float* out, int count);
++	static void GetAiInfo(int& mission, int& missionReady, int& fuel, int& shootAgain, int& ballSave);
+ 	static int SpecialAddScore(int score, bool mission = false);
+ 	static int AddRankProgress(int rank);
+ 	static void AdvanceWormHoleDestination(int flag);
+diff --git a/SpaceCadetPinball/pb.cpp b/SpaceCadetPinball/pb.cpp
+index 0762832..59c2079 100644
+--- a/SpaceCadetPinball/pb.cpp
++++ b/SpaceCadetPinball/pb.cpp
+@@ -3,6 +3,7 @@
+ 
+ 
+ #include "control.h"
++#include "ai_bridge.h"
+ #include "fullscrn.h"
+ #include "high_score.h"
+ #include "proj.h"
+@@ -320,8 +321,11 @@ void pb::frame(float dtMilliSec)
+ 		nudge::nudge_count = nudgeDec;
+ 	}
+ 	timer::check();
+-	render::update();
+-	score::update(MainTable->CurScoreStruct);
++	if (!ai::Headless)
++	{
++		render::update();
++		score::update(MainTable->CurScoreStruct);
++	}
+ 	if (!MainTable->TiltLockFlag)
+ 	{
+ 		if (nudge::nudge_count > 0.5f)
+diff --git a/SpaceCadetPinball/winmain.cpp b/SpaceCadetPinball/winmain.cpp
+index 836556f..e6f975e 100644
+--- a/SpaceCadetPinball/winmain.cpp
++++ b/SpaceCadetPinball/winmain.cpp
+@@ -1,6 +1,7 @@
+ #include "pch.h"
+ #include "winmain.h"
+ 
++#include "ai_bridge.h"
+ #include "control.h"
+ #include "EmbeddedData.h"
+ #include "fullscrn.h"
+@@ -73,6 +74,14 @@ int winmain::WinMain(LPCSTR lpCmdLine)
+ 
+ 	pb::quickFlag = strstr(lpCmdLine, "-quick") != nullptr;
+ 
++	int aiPort = 50007;
++	if (strstr(lpCmdLine, "-aitrain"))
++		ai::Enabled = ai::Headless = true;
++	else if (strstr(lpCmdLine, "-aiplay"))
++		ai::Enabled = true;
++	if (auto p = strstr(lpCmdLine, "-aiport="))
++		aiPort = atoi(p + 8);
++
+ 	// SDL window
+ 	SDL_Window* window = SDL_CreateWindow
+ 	(
+@@ -90,7 +99,7 @@ int winmain::WinMain(LPCSTR lpCmdLine)
+ 
+ 	// If HW fails, fallback to SW SDL renderer.
+ 	SDL_Renderer* renderer = nullptr;
+-	auto swOffset = strstr(lpCmdLine, "-sw") != nullptr ? 1 : 0;
++	auto swOffset = (strstr(lpCmdLine, "-sw") != nullptr || ai::Headless) ? 1 : 0;
+ 	for (int i = swOffset; i < 2 && !renderer; i++)
+ 	{
+ 		Renderer = renderer = SDL_CreateRenderer
+@@ -115,7 +124,7 @@ int winmain::WinMain(LPCSTR lpCmdLine)
+ 	auto basePath = SDL_GetBasePath();
+ 
+ 	// SDL mixer init
+-	bool mixOpened = false, noAudio = strstr(lpCmdLine, "-noaudio") != nullptr;
++	bool mixOpened = false, noAudio = strstr(lpCmdLine, "-noaudio") != nullptr || ai::Headless;
+ 	if (!noAudio)
+ 	{
+ 		if ((Mix_Init(MIX_INIT_MID_Proxy) & MIX_INIT_MID_Proxy) == 0)
+@@ -255,15 +264,25 @@ int winmain::WinMain(LPCSTR lpCmdLine)
+ 			auto resInfo = &fullscrn::resolution_array[fullscrn::GetResolution()];
+ 			SDL_SetWindowSize(MainWindow, resInfo->TableWidth, resInfo->TableHeight);
+ 		}
+-		SDL_ShowWindow(window);
+-		fullscrn::set_screen_mode(Options.FullScreen);
++		if (!ai::Headless)
++		{
++			SDL_ShowWindow(window);
++			fullscrn::set_screen_mode(Options.FullScreen);
++		}
+ 
+-		if (strstr(lpCmdLine, "-demo"))
+-			pb::toggle_demo();
++		if (ai::Enabled)
++		{
++			AiLoop(aiPort);
++		}
+ 		else
+-			pb::replay_level(false);
++		{
++			if (strstr(lpCmdLine, "-demo"))
++				pb::toggle_demo();
++			else
++				pb::replay_level(false);
+ 
+-		MainLoop();
++			MainLoop();
++		}
+ 
+ 		options::uninit();
+ 		midi::music_shutdown();
+@@ -372,23 +391,7 @@ void winmain::MainLoop()
+ 
+ 			if (UpdateToFrameCounter >= UpdateToFrameRatio)
+ 			{
+-				if (Options.HideCursor && CursorIdleCounter <= 0)
+-					ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+-				ImGui_ImplSDL2_NewFrame();
+-				ImGui_Render_NewFrame();
+-				ImGui::NewFrame();
+-				RenderUi();
+-
+-				SDL_RenderClear(Renderer);
+-				// Alternative clear hack, clear might fail on some systems
+-				// Todo: remove original clear, if save for all platforms
+-				SDL_RenderFillRect(Renderer, nullptr);
+-				render::PresentVScreen();
+-
+-				ImGui::Render();
+-				ImGui_Render_RenderDrawData(ImGui::GetDrawData());
+-
+-				SDL_RenderPresent(Renderer);
++				RenderFrame();
+ 				frameCounter++;
+ 				UpdateToFrameCounter -= UpdateToFrameRatio;
+ 			}
+@@ -452,6 +455,86 @@ void winmain::MainLoop()
+ 	}
+ }
+ 
++void winmain::RenderFrame()
++{
++	if (Options.HideCursor && CursorIdleCounter <= 0)
++		ImGui::SetMouseCursor(ImGuiMouseCursor_None);
++	ImGui_ImplSDL2_NewFrame();
++	ImGui_Render_NewFrame();
++	ImGui::NewFrame();
++	RenderUi();
++
++	SDL_RenderClear(Renderer);
++	// Alternative clear hack, clear might fail on some systems
++	// Todo: remove original clear, if save for all platforms
++	SDL_RenderFillRect(Renderer, nullptr);
++	render::PresentVScreen();
++
++	ImGui::Render();
++	ImGui_Render_RenderDrawData(ImGui::GetDrawData());
++
++	SDL_RenderPresent(Renderer);
++}
++
++void winmain::AiLoop(int port)
++{
++	if (!ai::Init(port))
++	{
++		printf("[ai] could not open the socket\n");
++		return;
++	}
++	bQuit = false;
++	single_step = false;
++	const auto frameTime = DurationMs(ai::FrameMs);
++	auto deadline = Clock::now();
++	unsigned frameNo = 0;
++
++	auto pump = [&]()
++	{
++		SDL_Event event;
++		while (SDL_PollEvent(&event))
++		{
++			if (!event_handler(&event))
++				bQuit = true;
++		}
++	};
++
++	ai::Command cmd{};
++	while (!bQuit && ai::ReadCommand(cmd))
++	{
++		if (cmd.Type == 'Q')
++			break;
++		if (cmd.Type == 'R')
++		{
++			ai::NewGame();
++			deadline = Clock::now();
++		}
++		else if (cmd.Type == 'S')
++		{
++			ai::SetFlippers(cmd.Left, cmd.Right);
++			for (int i = 0; i < cmd.Frames && !bQuit; i++)
++			{
++				pb::frame(ai::FrameMs);
++				ai::AfterFrame();
++				if (!ai::Headless)
++				{
++					pump();
++					if (++frameNo % 2 == 0)
++						RenderFrame();
++					deadline += std::chrono::duration_cast<Clock::duration>(frameTime);
++					auto now = Clock::now();
++					if (deadline > now)
++						HybridSleep(DurationMs(deadline - now));
++					else if (now - deadline > std::chrono::duration_cast<Clock::duration>(frameTime * 10))
++						deadline = now;
++				}
++			}
++		}
++		ai::Send(ai::Observation());
++	}
++	ai::Shutdown();
++}
++
+ void winmain::RenderUi()
+ {
+ 	// Transparent menu bar with a button for preventing menu lockout.
+@@ -888,6 +971,33 @@ int winmain::event_handler(const SDL_Event* event)
+ 		}
+ 	}
+ 
++	if (ai::Enabled)
++	{
++		switch (event->type)
++		{
++		case SDL_KEYDOWN:
++		case SDL_KEYUP:
++		case SDL_MOUSEBUTTONDOWN:
++		case SDL_MOUSEBUTTONUP:
++		case SDL_CONTROLLERBUTTONDOWN:
++		case SDL_CONTROLLERBUTTONUP:
++			return 1;
++		case SDL_WINDOWEVENT:
++			switch (event->window.event)
++			{
++			case SDL_WINDOWEVENT_FOCUS_GAINED:
++			case SDL_WINDOWEVENT_TAKE_FOCUS:
++			case SDL_WINDOWEVENT_SHOWN:
++			case SDL_WINDOWEVENT_FOCUS_LOST:
++			case SDL_WINDOWEVENT_HIDDEN:
++				return 1;
++			default: break;
++			}
++			break;
++		default: break;
++		}
++	}
++
+ 	switch (event->type)
+ 	{
+ 	case SDL_QUIT:
+diff --git a/SpaceCadetPinball/winmain.h b/SpaceCadetPinball/winmain.h
+index 104636a..0566fdc 100644
+--- a/SpaceCadetPinball/winmain.h
++++ b/SpaceCadetPinball/winmain.h
+@@ -112,5 +112,7 @@ private:
+ 	static void RenderFrameTimeDialog();
+ 	static void HybridSleep(DurationMs seconds);
+ 	static void MainLoop();
++	static void RenderFrame();
++	static void AiLoop(int port);
+ 	static void ImGuiMenuItemWShortcut(GameBindings binding, bool selected = false);
+ };
