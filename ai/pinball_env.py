@@ -8,6 +8,8 @@ import rewards as R
 from game_client import GameClient
 
 MAX_GAME_SECONDS = 1500
+STUCK_SECONDS = 15.0
+STUCK_MOVE = 0.05
 N_MISSION = 20
 N_LANES = 17
 OBS_DIM = 15 + 4 + 8 + 11 + N_MISSION + N_LANES + 2
@@ -100,11 +102,20 @@ class PinballEnv(gym.Env):
         self._init_flipper_state()
         self.up_flag = True
         self.last_progress = self.raw[self.ix.time]
+        self.still_pos, self.still_since = None, self.raw[self.ix.time]
         self.lane_lit = self._lane_count()
         self.ep_paid_hits = 0
         self.ep_steps = 0
         self.ep_forced = 0
         return self._obs()
+
+    def _ball_stuck(self, now, t):
+        pos = now[self.ix.balls][:, 1:3][now[self.ix.balls][:, 0] > 0.5]
+        moved = (self.still_pos is None or pos.shape != self.still_pos.shape
+                 or (pos.size and np.abs(pos - self.still_pos).max() > STUCK_MOVE))
+        if moved:
+            self.still_pos, self.still_since = pos, t
+        return bool(pos.size) and t - self.still_since > STUCK_SECONDS
 
     def prepare(self, action):
         cfg = R.stage_config(self.stage)
@@ -186,12 +197,15 @@ class PinballEnv(gym.Env):
 
         terminated = now[ix.game_over] > 0.5
         truncated = False
-        if not terminated:
+        if not terminated and self.headless:
             if t - self.last_progress > R.STALL_SECONDS:
                 truncated = True
                 reward += cfg.stall
             elif t > MAX_GAME_SECONDS:
                 truncated = True
+
+        if not terminated and not self.headless:
+            truncated = self._ball_stuck(now, t)
 
         info = {}
         if terminated or truncated:
