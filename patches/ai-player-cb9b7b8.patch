@@ -699,7 +699,7 @@ index 836556f..e6f975e 100644
  void winmain::RenderUi()
  {
  	// Transparent menu bar with a button for preventing menu lockout.
-@@ -888,6 +971,33 @@ int winmain::event_handler(const SDL_Event* event)
+@@ -888,6 +971,26 @@ int winmain::event_handler(const SDL_Event* event)
  		}
  	}
  
@@ -707,13 +707,6 @@ index 836556f..e6f975e 100644
 +	{
 +		switch (event->type)
 +		{
-+		case SDL_KEYDOWN:
-+		case SDL_KEYUP:
-+		case SDL_MOUSEBUTTONDOWN:
-+		case SDL_MOUSEBUTTONUP:
-+		case SDL_CONTROLLERBUTTONDOWN:
-+		case SDL_CONTROLLERBUTTONUP:
-+			return 1;
 +		case SDL_WINDOWEVENT:
 +			switch (event->window.event)
 +			{
